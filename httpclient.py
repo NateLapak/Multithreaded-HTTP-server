@@ -2,6 +2,8 @@ from sys import argv
 import socket
 
 '''
+This file implements a custom HTTP/1.1 client that establishes a TCP connection to an HTTP server, 
+constructs and sends GET/POST requests, receives the server's HTTP responses, and parses the response status code and body.
 
 '''
 
