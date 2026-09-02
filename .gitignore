@@ -1,0 +1,5 @@
+# Standard virtual environment names
+venv/
+.venv/
+
+free-tests.py
