@@ -1,11 +1,14 @@
-#include <iostream>
-
 /*
 This file sets up a basic multithreaded HTTP/1.1 server in C++ that connects to HTTPclient.py. 
 */
 
+#include <iostream>
+#include <string>
+//#include <filesystem>
+
+
 int main() {
-    std::cout << "Hello World" << std::endl;
+    std::cout << "Starting Server" << std::endl;
     return 0;
 }
 
@@ -253,9 +256,9 @@ int main() {
 // def main():
     
 //     # From https://docs.python.org/3/library/socketserver.html, The Python Software Foundation, downloaded 2024-01-07
-//     print("Starting server")
-//     with LabServer((HOST, PORT), LabHttpTCPHandler) as server:
-//         server.serve_forever()
+    // print("Starting server")
+    // with LabServer((HOST, PORT), LabHttpTCPHandler) as server:
+    //     server.serve_forever()
 
 
 // if __name__ == "__main__":
