@@ -2,264 +2,337 @@
 This file sets up a basic multithreaded HTTP/1.1 server in C++ that connects to HTTPclient.py. 
 */
 
+// server.cpp
+//
+// A multithreaded C++17 HTTP/1.1 server for macOS, translated from
+// server.py's LabHttpTCPHandler. Each accepted client connection is
+// handled on its own std::thread (thread-per-connection model), so
+// multiple clients can be served concurrently.
+//
+// Build:  clang++ -std=c++17 -O2 -pthread server.cpp -o server
+// Run:    ./server            (serves files from ./www)
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cctype>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <map>
+#include <sstream>
 #include <string>
-//#include <filesystem>
+#include <thread>
+#include <vector>
 
+namespace fs = std::filesystem;
 
-int main() {
-    std::cout << "Starting Server" << std::endl;
-    return 0;
+// ---------------- Configuration (mirrors server.py) ----------------
+static const char*       HOST        = "0.0.0.0"; // Host is 0.0.0.0
+static const int         PORT        = 8000; // Port 8000
+static const int         BACKLOG     = 64;
+static const std::string LINE_ENDING = "\r\n";
+static const std::string HTTP_1_1    = "HTTP/1.1"; // Format using HTTP/1.1
+
+// Resolved, absolute path to the directory we serve files from ("www")
+static fs::path SERVE_PATH;
+
+// ---------------- percent_decode ----------------
+// Decode %XX escape sequences in a URL path (mirrors percent_decode in server.py).
+std::string percent_decode(const std::string& s) {
+    std::string decoded;
+    size_t i = 0;
+    while (i < s.size()) {
+        if (s[i] == '%' && i + 2 < s.size() &&
+            std::isxdigit(static_cast<unsigned char>(s[i + 1])) &&
+            std::isxdigit(static_cast<unsigned char>(s[i + 2]))) {
+            std::string hex = s.substr(i + 1, 2);
+            char c = static_cast<char>(std::stoi(hex, nullptr, 16));
+            decoded += c;
+            i += 3;
+        } else {
+            decoded += s[i];
+            i += 1;
+        }
+    }
+    return decoded;
 }
 
+static std::string trim(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t");
+    size_t end = s.find_last_not_of(" \t");
+    if (start == std::string::npos) return "";
+    return s.substr(start, end - start + 1);
+}
 
-// import socketserver
-// import pathlib
+static std::vector<std::string> split_ws(const std::string& s) {
+    std::vector<std::string> out;
+    std::istringstream iss(s);
+    std::string tok;
+    while (iss >> tok) out.push_back(tok);
+    return out;
+}
 
-// HOST = "0.0.0.0"
-// PORT = 8000
-// BUFSIZE = 4096
-// LINE_ENDING='\r\n'
-// SERVE_PATH = pathlib.Path('www').resolve()
-// HTTP_1_1 = 'HTTP/1.1'
+/*
+Define the LabHTTPConection class
+    Purpose: Handles exactly one client connection. 
+    An instance of this class runs entirely on its own thread, 
+    so there is no shared mutable state between connections 
+*/
+class LabHttpConnection {
+public:
+    explicit LabHttpConnection(int client_fd) : fd_(client_fd) {}
 
-// class LabServer(socketserver.TCPServer):
-//     allow_reuse_address = True
+    ~LabHttpConnection() {
+        if (fd_ >= 0) close(fd_);
+    }
 
-// class LabServerTCPHandler(socketserver.StreamRequestHandler):
-//     def __init__(self, *args, **kwargs):
-//         self.charset = "UTF-8"
-//         self.serve_path = pathlib.Path("www").resolve()
-//         super().__init__(*args, **kwargs)
+    // Handle function attempts to read the content the client sent back 
+    void handle() {
+        try {
+            std::string req_line;
+            if (!read_line(req_line) || req_line.empty()) {
+                return; 
+            }
 
-//     def recieve_line(self):
-//         return self.rfile.readline().strip().decode(self.charset, 'ignore')
-    
-//     def send_line(self, line):
-//         self.wfile.write((line + LINE_ENDING).encode(self.charset, 'ignore'))
-    
-//     def handle(self):
-//         start_line = self.recieve_line()
-//         print("<", start_line)
+            // Attempt to parse request line
+            std::vector<std::string> parsed = split_ws(req_line);
+            if (parsed.size() < 2) {
+                send_error(400);
+                return;
+            }
 
-// '''
-//     Class that sets the server-wide options of server
-//     Code taken from lab instructions in task 2
-// '''
-// class LabHttpTcpServer(socketserver.TCPServer):
-//    allow_reuse_address = True
+            // Seperate reuqest line into method and path
+            std::string method = parsed[0];
+            std::string path   = parsed[1];
 
-// '''
-//     Class that handles one client connection
-//     Code taken from lab instructions in task 2
-// '''
+            // Read headers until a blank line.
+            std::map<std::string, std::string> headers;
+            std::string line;
+            while (read_line(line) && !line.empty()) {
+                auto pos = line.find(':');
+                if (pos != std::string::npos) {
+                    headers[trim(line.substr(0, pos))] = trim(line.substr(pos + 1));
+                }
+            }
 
-// class LabHttpTCPHandler(socketserver.StreamRequestHandler):
+            if (method == "GET") {
+                serve_file(path);
+            } else {
+                send_error(405);
+            }
+        } catch (...) {
+            std::cerr << "An error occurred while handling a connection\n";
+            send_error(500);
+        }
+    }
 
-//     # No need for __init__ function since the class inherits from StreamRequestHandler
-    
-//     '''
-//         Purpose: Handle the functionality of the client connecting
-//     '''
-//     def handle(self):
+private:
+    int fd_;
 
-//         try:
-//             # Read the HTTP request
-//             req_line = self.rfile.readline().decode('utf-8').strip()
+    // ---- low-level socket line I/O ----
 
-//             # Parse the request line into it's method, path and version components
-//             parsed_line = req_line.split() 
+    // Reads a single line terminated by '\n' (tolerates a preceding '\r'),
+    // strips the line ending, and returns false only if nothing was read
+    // before EOF/error.
+    bool read_line(std::string& out) {
+        out.clear();
+        char c;
+        ssize_t n;
+        bool got_any = false;
+        while ((n = recv(fd_, &c, 1, 0)) > 0) {
+            got_any = true;
+            if (c == '\n') break;
+            out += c;
+        }
+        if (!out.empty() && out.back() == '\r') out.pop_back();
+        return got_any;
+    }
 
-//             # Req_line must be host and path at minimum
-//             if len(parsed_line) < 2:
-//                 self.send_error(400) 
-//                 return
-            
-//             # Save HTTP method (GET, POST, PUT, etc)
-//             method = parsed_line[0]
+    void send_raw(const std::string& data) {
+        size_t sent = 0;
+        while (sent < data.size()) {
+            ssize_t n = send(fd_, data.data() + sent, data.size() - sent, 0);
+            if (n <= 0) break;
+            sent += static_cast<size_t>(n);
+        }
+    }
 
-//             # Save req path to handler (like /index.html)
-//             path = parsed_line[1]
+    // ---- request handling ----
 
+    // Serve a file under SERVE_PATH corresponding to the request path.
+    void serve_file(const std::string& raw_path) {
+        std::string decoded_path = percent_decode(raw_path);
 
-//             '''
-//                 This code reads all the request lines until it hits a blank line
-//             '''
+        fs::path file_path;
+        if (decoded_path == "/") {
+            file_path = SERVE_PATH / "index.html";
+        } else {
+            std::string rel = decoded_path;
+            while (!rel.empty() && rel.front() == '/') rel.erase(rel.begin());
+            file_path = SERVE_PATH / rel;
 
-//             # Store headers from request_line here
-//             headers = {}
-//             while True:
-//                 req_line = self.rfile.readline().decode('utf-8').strip()
+            std::error_code ec;
+            if (fs::is_directory(file_path, ec)) {
+                // Directory requested without a trailing slash -> redirect.
+                if (raw_path.empty() || raw_path.back() != '/') {
+                    send_error(301, raw_path);
+                    return;
+                }
+                file_path = file_path / "index.html";
+            }
+        }
 
-//                 # Break if line is empty
-//                 if req_line == "":
-//                     break
-                
-//                 k, v = req_line.split(":", 1)
-//                 headers[k.strip()] = v.strip()
+        // 403 check: the resolved path must stay within SERVE_PATH.
+        std::error_code ec;
+        fs::path resolved = fs::weakly_canonical(file_path, ec);
+        fs::path served_resolved = fs::weakly_canonical(SERVE_PATH, ec);
+        if (ec) {
+            send_error(403);
+            return;
+        }
+        fs::path rel_check = resolved.lexically_relative(served_resolved);
+        std::string rel_str = rel_check.string();
+        if (rel_check.empty() || rel_str == ".." ||
+            rel_str.rfind("..", 0) == 0 /* starts with ".." */) {
+            send_error(403);
+            return;
+        }
 
-//             # Serve file if HTTP method is a GET request, otherwise send 405 error
-//             if method == "GET":
-//                 self.serve_file(path)
-//             else:
-//                 self.error(405) 
+        if (fs::exists(resolved, ec) && fs::is_regular_file(resolved, ec)) {
+            std::ifstream f(resolved, std::ios::binary);
+            std::ostringstream ss;
+            ss << f.rdbuf();
+            std::string body = ss.str();
 
-//         except:
-//             print("An error botting up the server occured")
-//             self.error(500)
+            // Normalize CRLF -> LF, mirroring server.py's body.replace(b"\r\n", b"\n")
+            std::string normalized;
+            normalized.reserve(body.size());
+            for (size_t i = 0; i < body.size(); ++i) {
+                if (body[i] == '\r' && i + 1 < body.size() && body[i + 1] == '\n') {
+                    continue; // drop the \r, the \n gets appended on the next loop iteration
+                }
+                normalized += body[i];
+            }
+            body.swap(normalized);
 
+            std::string content_type = "text/html";
+            if (resolved.extension() == ".css") {
+                content_type = "text/css; charset=utf-8";
+            }
 
-//     # HTTP req is valid, serve file using path passed as the parameter
-//     def serve_file(self, path = "index.html"):
+            std::ostringstream resp;
+            resp << HTTP_1_1 << " 200 OK" << LINE_ENDING;
+            resp << "Content-Length: " << body.size() << LINE_ENDING;
+            resp << "Content-Type: " << content_type << "; charset=utf-8" << LINE_ENDING;
+            resp << "Connection: Close" << LINE_ENDING;
+            resp << LINE_ENDING;
+            send_raw(resp.str());
+            send_raw(body);
+        } else {
+            send_error(404);
+        }
+    }
 
-//         decode_path = self.percent_decode(path)
-        
-//         # Path is root
-//         if decode_path == "/":
-//             file_path = SERVE_PATH / "index.html"
+    // Send an HTTP error response.
+    // NOTE: server.py's error() concatenates str(err_code) into `reason` and
+    // then writes "{err_code} {reason}" on the status line, producing a
+    // duplicated code (e.g. "400 400 Bad request"). That's fixed here.
+    void send_error(int err_code, const std::string& path = "/") {
+        if (err_code == 301) {
+            std::string new_location = path + "/";
+            std::ostringstream resp;
+            resp << HTTP_1_1 << " 301 Moved Permanently" << LINE_ENDING;
+            resp << "Location: " << new_location << LINE_ENDING;
+            resp << "Content-Length: 0" << LINE_ENDING;
+            resp << "Connection: Close" << LINE_ENDING << LINE_ENDING;
+            send_raw(resp.str());
+            return;
+        }
 
-//         else:
-            
-//             # Non root directory
-//             file_path = SERVE_PATH / decode_path.lstrip("/")
+        std::string reason;
+        switch (err_code) {
+            case 400: reason = "Bad Request"; break;
+            case 403: reason = "Forbidden"; break;
+            case 404: reason = "Not Found"; break;
+            case 500: reason = "Internal Server Error"; break;
+            case 405: reason = "Method Not Allowed"; break;
+            default:  reason = "Error"; break;
+        }
 
-//             # File path is a directory (like http://127.0.0.1:8000/deep/, server would see /deep/)
-//             if file_path.is_dir():
+        std::string body = "<html><body><h1>" + std::to_string(err_code) + " " +
+                            reason + "</h1></body></html>";
 
-//                 # Path doesn't end with '/', 301 error
-//                 if not path.endswith("/"):
-//                     self.error(301, path)
+        std::ostringstream resp;
+        resp << HTTP_1_1 << " " << err_code << " " << reason << LINE_ENDING;
+        resp << "Content-Length: " << body.size() << LINE_ENDING;
+        resp << "Content-Type: text/html; charset=utf-8" << LINE_ENDING;
+        resp << "Connection: Close" << LINE_ENDING;
+        resp << LINE_ENDING;
+        send_raw(resp.str());
+        send_raw(body);
+    }
+};
 
-//                 # Path ends with '/', serve index.html inside the directory
-//                 file_path = file_path / "index.html"
+// ---------------- main / accept loop ----------------
 
-//         # Check for 403 error (don't have the necessary permissions to access requested source)
-//         try:
-//             file_path = file_path.resolve()
-//             SERVE_PATH.resolve()
-//             file_path.relative_to(SERVE_PATH.resolve())
+int main() {
+    SERVE_PATH = fs::absolute("www").lexically_normal();
 
-//         except ValueError:
-//             self.error(403)
-//             return
+    // Use the socket POSIX command to create a socket
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket");
+        return 1;
+    }
 
-//         # Check if file_path exists and is an actual file, then read it's the file content
-//         if file_path.exists() and file_path.is_file():
-//             with open(file_path, "rb") as f:
-//                 body = f.read()
+    int opt = 1;
 
-//             # Change all instances of \r\n to \n
-//             body = body.replace(b"\r\n", b"\n")
+    // IUse the setsocketopt to set an option on the socket
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-//             content_type = "text/html"
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    inet_pton(AF_INET, HOST, &addr.sin_addr);
 
-//             # Determine content type based on file extension
-//             if file_path.suffix == ".css":
-//                 content_type = "text/css; charset=utf-8"
-            
-//             # Send HTTP response in HTTP response format
-//             self.wfile.write(f"{HTTP_1_1} 200 OK\r\n".encode())
-//             self.wfile.write(f"Content-Length: {len(body)}\r\n".encode())
-//             self.wfile.write(f"Content-Type: {content_type}; charset=utf-8\r\n".encode())
-//             self.wfile.write(f"Connection: Close\r\n".encode())
-//             self.wfile.write(b"\r\n")
-//             self.wfile.write(body)
+    // Attach socket to a specific local address and port
+    if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        perror("bind");
+        close(server_fd);
+        return 1;
+    }
 
-//         # File does not exist, send 404 error
-//         else:
-//             self.error(404)
+    // Make the socket a passive listening socket
+    if (listen(server_fd, BACKLOG) < 0) {
+        perror("listen");
+        close(server_fd);
+        return 1;
+    }
 
-//     # HTTP request is invalid, print out error code
-//     def error(self, err_code, path = "/"):
+    std::cout << "Starting server on " << HOST << ":" << PORT
+              << ", serving " << SERVE_PATH << "\n";
 
-//         reason = ""
+    while (true) {
+        sockaddr_in client_addr{};
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+        if (client_fd < 0) {
+            perror("accept");
+            continue;
+        }
 
-//         '''
-//         HTTP/1.1 301 Moved Permanently
-//         Location: /path/
-//         Content-Length: 0
-//         Connection: Close
-//         '''
-//         if err_code == 301:
-//             new_location = path + "/"
-//             self.wfile.write(f"{HTTP_1_1} 301 Moved Permanently\r\n".encode())
-//             self.wfile.write(f"Location: {new_location}\r\n".encode())
-//             self.wfile.write(b"Content-Length: 0\r\n")
-//             self.wfile.write(b"Connection: Close\r\n\r\n")
-//             return
+        // One detached thread per connection -> multithreaded server.
+        std::thread([client_fd]() {
+            LabHttpConnection conn(client_fd);
+            conn.handle();
+        }).detach();
+    }
 
-//         # 400 error code
-//         elif err_code == 400:
-//             reason = str(err_code) + " Bad request"
-        
-//         # 403 error code
-//         elif err_code == 403:
-//             reason = str(err_code) + " Forbidden error"
-
-//         # 404 error code
-//         elif err_code == 404:
-//             reason = str(err_code) + " Not found"
-
-//         # 500 err code
-//         elif err_code == 500:
-//             reason = str(err_code) + " Internel Server Error"
-
-//         # 405 err code
-//         elif err_code == 405:
-//             reason = str(err_code) + " Method not allowed"
-
-//         else:
-//             reason = str(err_code)
-
-//         # Body of the error page
-//         body = f"<html><body><h1>{err_code} {reason}</h1></body></html>".encode("utf-8")
-
-//         # Write HTTP response back to HTTP
-//         self.wfile.write(f"{HTTP_1_1} {err_code} {reason}\r\n".encode())
-//         self.wfile.write(f"Content-Length: {len(body)}\r\n".encode())
-//         self.wfile.write(f"Content-Type: text/html; charset=utf-8 \r\n".encode())
-//         self.wfile.write(f"Connection: Close \r\n".encode())
-//         self.wfile.write(b"\r\n")
-   
-//         # Encode error code, then write to status line
-//         self.wfile.write(body)
-
-//     # Decode any percent encoded string given by the request_line
-//     def percent_decode(self, s):
-
-//         decoded_str = ""
-//         i = 0
-
-//         # Loop over each char in s
-//         while i < len(s):
-
-//             # Current char is % and 2 chars follow, there is a percent encoded sequence
-//             if s[i] == "%" and i + 2 < len(s):
-
-//                 # Algorithm to decode percent-encoded sequence:
-//                 # Take the next two characters (s[i+1:i+3])
-//                 # Convert them from hexadecimal to an integer
-//                 # Then convert that integer to its ASCII character
-//                 # Append this decoded character to 'decoded'
-
-
-//                 decoded_str += chr(int(s[i+1:i+3], 16)) 
-//                 i += 3
-
-//             # Otherwise, just append char to decoded_str
-//             else:
-//                 decoded_str += s[i]
-//                 i += 1
-//         return decoded_str
-
-
-// def main():
-    
-//     # From https://docs.python.org/3/library/socketserver.html, The Python Software Foundation, downloaded 2024-01-07
-    // print("Starting server")
-    // with LabServer((HOST, PORT), LabHttpTCPHandler) as server:
-    //     server.serve_forever()
-
-
-// if __name__ == "__main__":
-//     main()
+    close(server_fd);
+    return 0;
+}
